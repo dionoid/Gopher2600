@@ -61,6 +61,20 @@ type CPU struct {
 	// is outside of the direct control of the CPU.
 	NoFlowControl bool
 
+	// whether the CPU is in an interrupt block of code. this field is >0 when
+	// the PC has been loaded with the address pointed to by the NMI address. it
+	// is possible for the the code to be interrupted while inside an interrupt,
+	// which is why this field is an integer rather than a boolean
+	//
+	// we can think of this as an extended I status flag that is increased on a
+	// NMI or IRQ signal (but not a BRK instruction) and reduced on RTI (when
+	// the break flag in the status register is cleared)
+	interruptDepth int
+
+	// an interrupt has occured and so the next instruction will indicate that
+	// it was executed as a result of the interrupt
+	interrupt bool
+
 	// Whether the last memory access by the CPU was a phantom access
 	PhantomMemAccess bool
 
@@ -75,8 +89,21 @@ const (
 	// Reset is the address where the reset address is stored.
 	Reset = uint16(0xfffc)
 
-	// BRK is the address where the interrupt address is stored.
-	BRK = uint16(0xfffe)
+	// IRQ is the address where the interrupt address is stored.
+	IRQ = uint16(0xfffe)
+
+	// for clarity, BRK is another name for IRQ. we use this when triggering
+	// software interrupts
+	BRK = IRQ
+)
+
+// it is believed that internalParameter is a value that is inherent to the brand of chip. whatever it is
+// exactly, if is used in the XAA or LAX (immediate) instructions
+//
+// we call it internalParameter because that's how it's referred to in 64doc.txt
+const (
+	internalParameterXAA = 0xee
+	internalParameterLAX = 0x00
 )
 
 // Memory interface to underlying implmentation. See MemoryAddressError
@@ -117,12 +144,74 @@ func (mc *CPU) String() string {
 	return fmt.Sprintf("%s=%s %s=%s %s=%s %s=%s %s=%s %s=%s",
 		mc.PC.Label(), mc.PC, mc.A.Label(), mc.A,
 		mc.X.Label(), mc.X, mc.Y.Label(), mc.Y,
-		mc.SP.Label(), mc.SP, mc.Status.Label(), mc.Status)
+		mc.SP.Label(), mc.SP, mc.Status.Label(), mc.Status,
+	)
 }
 
 // SetRDY sets the CPU RDY flag. equivalent to pin 3 of the 6507
 func (mc *CPU) SetRDY(rdy bool) {
 	mc.RdyFlg = rdy
+}
+
+// InInterrupt returns true if executed instructions will be between an NMI/IRQ
+// and an RTI. Remember that it's possible for an NMI to interrupt on an ongoing
+// interrupt handler, so an RTI will not necessarily cause InInterrupt to return
+// false on the next call
+func (mc *CPU) InInterrupt() bool {
+	return mc.interruptDepth > 0
+}
+
+// Interrupt loads the PC with the 16bit value at the NMI address (when
+// NMI is true) or at the IRQ address
+func (mc *CPU) Interrupt(nonMaskable bool) error {
+	// the interruptDepth field is now >0 and indicates that the CPU is in the
+	// interrupted state. if the CPU has been interrupted previously without an
+	// intervening RTI then the field will be >1
+	mc.interruptDepth++
+
+	// an interrupt has occurred and will be indicated in the restul for the next instruction
+	mc.interrupt = true
+
+	// IRQ interrupts only take effect if the InterruptDisable flag is unset
+	if !nonMaskable {
+		if mc.Status.InterruptDisable {
+			return nil
+		}
+	}
+
+	// push MSB of PC onto stack, and decrement SP
+	err := mc.write8Bit(mc.SP.Address(), uint8(mc.PC.Address()>>8), false)
+	if err != nil {
+		return err
+	}
+	mc.SP.Add(0xff, false)
+
+	// push LSB of PC onto stack, and decrement SP
+	err = mc.write8Bit(mc.SP.Address(), uint8(mc.PC.Address()), false)
+	if err != nil {
+		return err
+	}
+	mc.SP.Add(0xff, false)
+
+	// push status register
+	err = mc.write8Bit(mc.SP.Address(), mc.Status.Value(), false)
+	if err != nil {
+		return err
+	}
+	mc.SP.Add(0xff, false)
+
+	// set the interrupt disable flag after pushing the status register to the
+	// stack. this is so the flag is cleared when the status register is restored
+	//
+	// NMI interrupts do not set the InterruptDisable flag
+	if !nonMaskable {
+		mc.Status.InterruptDisable = true
+	}
+
+	if nonMaskable {
+		return mc.LoadPCIndirect(NMI)
+	}
+	return mc.LoadPCIndirect(IRQ)
 }
 
 type Random interface {
@@ -134,6 +223,8 @@ func (mc *CPU) Reset(rnd Random) error {
 	mc.LastResult.Reset()
 	mc.Killed = false
 	mc.cycleCallback = nil
+	mc.interruptDepth = 0
+	mc.interrupt = false
 
 	if rnd == nil {
 		mc.PC.Load(0x0000)
@@ -156,28 +247,23 @@ func (mc *CPU) Reset(rnd Random) error {
 	// A or any other register
 	mc.Status.InterruptDisable = true
 
+	// the reset procedure is special in that it leaves the information about the last executed
+	// instruction in the "final" state
+	mc.LastResult.Final = true
+
 	// we simplify the reset procedure to reducing the stack value three times and then loading the
 	// reset address into the PC. there's no need to emulate the full eight cycles of the
 	// initilisation process
 	mc.SP.Add(0xff, false)
 	mc.SP.Add(0xff, false)
 	mc.SP.Add(0xff, false)
-	lo, err := mc.mem.Read(Reset)
+	err := mc.LoadPCIndirect(Reset)
 	if err != nil {
-		return fmt.Errorf("cpu reset: %w", err)
+		return err
 	}
-	hi, err := mc.mem.Read(Reset + 1)
-	if err != nil {
-		return fmt.Errorf("cpu reset: %w", err)
-	}
-	mc.PC.Load((uint16(hi) << 8) | uint16(lo))
 
 	// cpu is ready immediately after reset
 	mc.RdyFlg = true
-
-	// the reset procedure is special in that it leaves the information about the last executed
-	// instruction in the "final" state
-	mc.LastResult.Final = true
 
 	return nil
 }
@@ -190,6 +276,27 @@ func (mc *CPU) HasReset() bool {
 	// the Final flag in LastResult is not normally set when the defintion field is nil. however, we
 	// explicitely set the Final flag to true when resetting the CPU
 	return mc.LastResult.Defn == nil && mc.LastResult.Final == true
+}
+
+// LoadPC loads the contents of directAddress into the PC.
+func (mc *CPU) LoadPCIndirect(address uint16) error {
+	if !mc.LastResult.Final {
+		return fmt.Errorf("cpu: load PC invalid mid-instruction")
+	}
+
+	mc.PhantomMemAccess = false
+
+	lo, err := mc.mem.Read(address)
+	if err != nil {
+		return err
+	}
+	hi, err := mc.mem.Read(address + 1)
+	if err != nil {
+		return err
+	}
+	mc.PC.Load((uint16(hi) << 8) | uint16(lo))
+
+	return nil
 }
 
 // LoadPC loads the contents of directAddress into the PC.
@@ -234,6 +341,13 @@ func (mc *CPU) write8Bit(address uint16, value uint8, phantom bool) error {
 		return err
 	}
 
+	// +1 cycle
+	mc.LastResult.Cycles++
+	err = mc.cycleCallback()
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -242,8 +356,6 @@ func (mc *CPU) write8Bit(address uint16, value uint8, phantom bool) error {
 // side-effects:
 //   - calls cycleCallback after each 8bit read
 func (mc *CPU) read16Bit(address uint16) (uint16, error) {
-	mc.PhantomMemAccess = false
-
 	lo, err := mc.mem.Read(address)
 	if err != nil {
 		return 0, err
@@ -256,7 +368,8 @@ func (mc *CPU) read16Bit(address uint16) (uint16, error) {
 		return 0, err
 	}
 
-	hi, err := mc.mem.Read(address + 1)
+	// advance address and being careful to preserve page
+	hi, err := mc.mem.Read((address & 0xff00) | ((address + 1) & 0x00ff))
 	if err != nil {
 		return 0, err
 	}
@@ -506,6 +619,9 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 	// prepare new round of results
 	mc.LastResult.Reset()
 	mc.LastResult.Address = mc.PC.Address()
+	mc.LastResult.FromInterrupt = mc.interrupt
+	mc.interrupt = false
+	mc.LastResult.InInterrupt = mc.InInterrupt()
 
 	var err error
 
@@ -874,13 +990,14 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 	//  - for write modes, we only use the address to write a value we already have
 	//  - for flow modes, the use of the address is very specific
 	if !(defn.AddressingMode == instructions.Implied || defn.AddressingMode == instructions.Immediate) {
-		if defn.Effect == instructions.Read {
+		switch defn.Effect {
+		case instructions.Read:
 			// +1 cycle
 			value, err = mc.read8Bit(address, false)
 			if err != nil {
 				return err
 			}
-		} else if defn.Effect == instructions.RMW {
+		case instructions.RMW:
 			// +1 cycle
 			value, err = mc.read8Bit(address, false)
 			if err != nil {
@@ -890,12 +1007,6 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 			// phantom write
 			// +1 cycle
 			err = mc.write8Bit(address, value, true)
-			if err != nil {
-				return err
-			}
-
-			mc.LastResult.Cycles++
-			err = mc.cycleCallback()
 			if err != nil {
 				return err
 			}
@@ -935,20 +1046,14 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 			return err
 		}
 		mc.SP.Add(0xff, false)
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
-		if err != nil {
-			return err
-		}
 
 	case instructions.Pla:
 		// +1 cycle
-		mc.SP.Add(1, false)
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
+		value, err = mc.read8Bit(mc.SP.Address(), true)
 		if err != nil {
 			return err
 		}
+		mc.SP.Add(1, false)
 
 		// +1 cycle
 		value, err = mc.read8Bit(mc.SP.Address(), false)
@@ -966,20 +1071,15 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 			return err
 		}
 		mc.SP.Add(0xff, false)
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
-		if err != nil {
-			return err
-		}
 
 	case instructions.Plp:
 		// +1 cycle
-		mc.SP.Add(1, false)
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
+		value, err = mc.read8Bit(mc.SP.Address(), true)
 		if err != nil {
 			return err
 		}
+		mc.SP.Add(1, false)
+
 		// +1 cycle
 		value, err = mc.read8Bit(mc.SP.Address(), false)
 		if err != nil {
@@ -1052,11 +1152,6 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 		if err != nil {
 			return err
 		}
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
-		if err != nil {
-			return err
-		}
 
 	case instructions.Stx:
 		// +1 cycle
@@ -1064,20 +1159,10 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 		if err != nil {
 			return err
 		}
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
-		if err != nil {
-			return err
-		}
 
 	case instructions.Sty:
 		// +1 cycle
 		err = mc.write8Bit(address, mc.Y.Value(), false)
-		if err != nil {
-			return err
-		}
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
 		if err != nil {
 			return err
 		}
@@ -1130,10 +1215,7 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 
 	case instructions.Adc:
 		if mc.Status.DecimalMode {
-			mc.Status.Carry,
-				mc.Status.Zero,
-				mc.Status.Overflow,
-				mc.Status.Sign = mc.A.AddDecimal(value, mc.Status.Carry)
+			mc.Status.Carry, mc.Status.Zero, mc.Status.Overflow, mc.Status.Sign = mc.A.AddDecimal(value, mc.Status.Carry)
 		} else {
 			mc.Status.Carry, mc.Status.Overflow = mc.A.Add(value, mc.Status.Carry)
 			mc.Status.Zero = mc.A.IsZero()
@@ -1158,78 +1240,72 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 		}
 
 	case instructions.Ror:
-		var r *registers.Data
 		if defn.Effect == instructions.RMW {
-			r = &mc.acc8
-			r.Load(value)
+			mc.acc8.Load(value)
+			mc.Status.Carry = mc.acc8.ROR(mc.Status.Carry)
+			mc.Status.Zero = mc.acc8.IsZero()
+			mc.Status.Sign = mc.acc8.IsNegative()
+			value = mc.acc8.Value()
 		} else {
-			r = &mc.A
+			mc.Status.Carry = mc.A.ROR(mc.Status.Carry)
+			mc.Status.Zero = mc.A.IsZero()
+			mc.Status.Sign = mc.A.IsNegative()
 		}
-		mc.Status.Carry = r.ROR(mc.Status.Carry)
-		mc.Status.Zero = r.IsZero()
-		mc.Status.Sign = r.IsNegative()
-		value = r.Value()
 
 	case instructions.Rol:
-		var r *registers.Data
 		if defn.Effect == instructions.RMW {
-			r = &mc.acc8
-			r.Load(value)
+			mc.acc8.Load(value)
+			mc.Status.Carry = mc.acc8.ROL(mc.Status.Carry)
+			mc.Status.Zero = mc.acc8.IsZero()
+			mc.Status.Sign = mc.acc8.IsNegative()
+			value = mc.acc8.Value()
 		} else {
-			r = &mc.A
+			mc.Status.Carry = mc.A.ROL(mc.Status.Carry)
+			mc.Status.Zero = mc.A.IsZero()
+			mc.Status.Sign = mc.A.IsNegative()
 		}
-		mc.Status.Carry = r.ROL(mc.Status.Carry)
-		mc.Status.Zero = r.IsZero()
-		mc.Status.Sign = r.IsNegative()
-		value = r.Value()
 
 	case instructions.Inc:
-		r := mc.acc8
-		r.Load(value)
-		r.Add(1, false)
-		mc.Status.Zero = r.IsZero()
-		mc.Status.Sign = r.IsNegative()
-		value = r.Value()
+		mc.acc8.Load(value)
+		mc.acc8.Add(1, false)
+		mc.Status.Zero = mc.acc8.IsZero()
+		mc.Status.Sign = mc.acc8.IsNegative()
+		value = mc.acc8.Value()
 
 	case instructions.Dec:
-		r := mc.acc8
-		r.Load(value)
-		r.Add(0xff, false)
-		mc.Status.Zero = r.IsZero()
-		mc.Status.Sign = r.IsNegative()
-		value = r.Value()
+		mc.acc8.Load(value)
+		mc.acc8.Add(0xff, false)
+		mc.Status.Zero = mc.acc8.IsZero()
+		mc.Status.Sign = mc.acc8.IsNegative()
+		value = mc.acc8.Value()
 
 	case instructions.Cmp:
-		r := mc.acc8
-		r.Load(mc.A.Value())
+		mc.acc8.Load(mc.A.Value())
 
 		// maybe surprisingly, CMP can be implemented with binary subtract even
 		// if decimal mode is active (the meaning is the same)
-		mc.Status.Carry, _ = r.Subtract(value, true)
-		mc.Status.Zero = r.IsZero()
-		mc.Status.Sign = r.IsNegative()
+		mc.Status.Carry, _ = mc.acc8.Subtract(value, true)
+		mc.Status.Zero = mc.acc8.IsZero()
+		mc.Status.Sign = mc.acc8.IsNegative()
 
 	case instructions.Cpx:
-		r := mc.acc8
-		r.Load(mc.X.Value())
-		mc.Status.Carry, _ = r.Subtract(value, true)
-		mc.Status.Zero = r.IsZero()
-		mc.Status.Sign = r.IsNegative()
+		mc.acc8.Load(mc.X.Value())
+		mc.Status.Carry, _ = mc.acc8.Subtract(value, true)
+		mc.Status.Zero = mc.acc8.IsZero()
+		mc.Status.Sign = mc.acc8.IsNegative()
 
 	case instructions.Cpy:
-		r := mc.acc8
-		r.Load(mc.Y.Value())
-		mc.Status.Carry, _ = r.Subtract(value, true)
-		mc.Status.Zero = r.IsZero()
-		mc.Status.Sign = r.IsNegative()
+		mc.acc8.Load(mc.Y.Value())
+		mc.Status.Carry, _ = mc.acc8.Subtract(value, true)
+		mc.Status.Zero = mc.acc8.IsZero()
+		mc.Status.Sign = mc.acc8.IsNegative()
 
 	case instructions.Bit:
-		r := mc.acc8
-		r.Load(value)
-		mc.Status.Sign = r.IsNegative()
-		mc.Status.Overflow = r.IsBitV()
-		r.AND(mc.A.Value())
-		mc.Status.Zero = r.IsZero()
+		mc.acc8.Load(value)
+		mc.Status.Sign = mc.acc8.IsNegative()
+		mc.Status.Overflow = mc.acc8.IsBitV()
+		mc.acc8.AND(mc.A.Value())
+		mc.Status.Zero = mc.acc8.IsZero()
 
 	case instructions.Jmp:
 		if !mc.NoFlowControl {
@@ -1290,11 +1366,9 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 		if err != nil {
 			return err
 		}
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
-		if err != nil {
-			return err
-		}
+
+		// dummy fetch from stack
+		mc.read8Bit(mc.SP.Address(), true)
 
 		// the current value of the PC is now correct, even though we've only read
 		// one byte of the address so far. remember, RTS increments the PC when
@@ -1307,11 +1381,6 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 			return err
 		}
 		mc.SP.Add(0xff, false)
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
-		if err != nil {
-			return err
-		}
 
 		// push LSB of PC onto stack, and decrement SP
 		// +1 cycle
@@ -1320,11 +1389,6 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 			return err
 		}
 		mc.SP.Add(0xff, false)
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
-		if err != nil {
-			return err
-		}
 
 		// +1 cycle
 		err = mc.read8BitPC(hiByte)
@@ -1361,13 +1425,12 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 
 		mc.SP.Add(1, false)
 		if !mc.NoFlowControl {
-			// load and correct PC
 			mc.PC.Load(rtsAddress)
-			mc.PC.Add(1)
 		}
 
 		// +1 cycle
 		_, err = mc.read8Bit(mc.PC.Address(), false)
+		mc.PC.Add(1)
 
 	case instructions.Brk:
 		// push PC onto register (same effect as JSR)
@@ -1378,11 +1441,6 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 
 		// +1 cycle
 		mc.SP.Add(0xff, false)
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
-		if err != nil {
-			return err
-		}
 
 		err = mc.write8Bit(mc.SP.Address(), uint8(mc.PC.Address()), false)
 		if err != nil {
@@ -1391,11 +1449,6 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 
 		// +1 cycle
 		mc.SP.Add(0xff, false)
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
-		if err != nil {
-			return err
-		}
 
 		// push status register (same effect as PHP)
 		err = mc.write8Bit(mc.SP.Address(), mc.Status.Value(), false)
@@ -1403,16 +1456,13 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 			return err
 		}
 
-		// +1 cycle
 		mc.SP.Add(0xff, false)
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
-		if err != nil {
-			return err
-		}
 
-		// set the break flag
+		// set the break and interrupt disable flags after pushing the status
+		// register to the stack. this is so the flags are cleared when the
+		// status register is restored
 		mc.Status.Break = true
+		mc.Status.InterruptDisable = true
 
 		// perform jump
 		var brkAddress uint16
@@ -1425,17 +1475,29 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 		}
 
 	case instructions.Rti:
+		// software breaks (the BRK instruction) can be distinguished from
+		// hardware interrupts by the break flag
+		if mc.Status.Break {
+			if mc.interruptDepth > 0 {
+				// reduce depth count by one. if the count is now zero then the CPU is
+				// no longer in the interrupt state. if however, the an interrupt
+				// happened whilst inside an interrupt, the count will still be >0
+				mc.interruptDepth--
+			} else {
+				// if interruptDepth is zero then that means that RTI has been called outside of
+				// interupt block
+			}
+		}
+
+		// +1 cycles
+		_, err = mc.read8Bit(mc.SP.Address(), true)
+		if err != nil {
+			return err
+		}
+
 		// pull status register (same effect as PLP)
 		if !mc.NoFlowControl {
 			mc.SP.Add(1, false)
-		}
-
-		// not sure when this cycle should occur
-		// +1 cycle
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
-		if err != nil {
-			return err
 		}
 
 		// +1 cycles
@@ -1469,24 +1531,27 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 		// does nothing (2 byte nop)
 
 	case instructions.LAX:
-		mc.A.Load(value)
+		if defn.AddressingMode == instructions.Immediate {
+			mc.A.Load((mc.A.Value() | internalParameterLAX) & value)
+		} else {
+			mc.A.Load(value)
+		}
 		mc.Status.Zero = mc.A.IsZero()
 		mc.Status.Sign = mc.A.IsNegative()
-		mc.X.Load(value)
+		mc.X.Load(mc.A.Value())
 
 	case instructions.DCP:
 		// AND the contents of the A register with value...
 		// decrease value...
-		r := mc.acc8
-		r.Load(value)
-		r.Add(0xff, false)
-		value = r.Value()
+		mc.acc8.Load(value)
+		mc.acc8.Add(0xff, false)
+		value = mc.acc8.Value()
 
 		// ... and compare with the A register
-		r.Load(mc.A.Value())
-		mc.Status.Carry, _ = r.Subtract(value, true)
-		mc.Status.Zero = r.IsZero()
-		mc.Status.Sign = r.IsNegative()
+		mc.acc8.Load(mc.A.Value())
+		mc.Status.Carry, _ = mc.acc8.Subtract(value, true)
+		mc.Status.Zero = mc.acc8.IsZero()
+		mc.Status.Sign = mc.acc8.IsNegative()
 
 	case instructions.ASR:
 		mc.A.AND(value)
@@ -1497,8 +1562,20 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 		mc.Status.Sign = mc.A.IsNegative()
 
 	case instructions.XAA:
-		mc.A.Load(mc.X.Value())
-		mc.A.AND(value)
+		// description for "64doc.txt"
+		//
+		// "A = (A | #$EE) & X & #byte
+		// same as
+		// A = ((A & #$11 & X) | ( #$EE & X)) & #byte
+		//
+		// In real 6510/8502 the internal parameter #$11 may occasionally be #$10, #$01 or even
+		// #$00. This occurs when the video chip starts DMA between the opcode fetch and the
+		// parameter fetch of the instruction.  The value probably depends on the data that was left
+		// on the bus by the VIC-II"
+		//
+		// note that XAA is referred to as ANE in 64doc.txt
+
+		mc.A.Load((mc.A.Value() | internalParameterXAA) & mc.X.Value() & value)
 		mc.Status.Zero = mc.A.IsZero()
 		mc.Status.Sign = mc.A.IsNegative()
 
@@ -1513,17 +1590,11 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 		mc.Status.Sign = mc.X.IsNegative()
 
 	case instructions.SAX:
-		r := mc.acc8
-		r.Load(mc.A.Value())
-		r.AND(mc.X.Value())
+		mc.acc8.Load(mc.A.Value())
+		mc.acc8.AND(mc.X.Value())
 
 		// +1 cycle
-		err = mc.write8Bit(address, r.Value(), false)
-		if err != nil {
-			return err
-		}
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
+		err = mc.write8Bit(address, mc.acc8.Value(), false)
 		if err != nil {
 			return err
 		}
@@ -1606,33 +1677,35 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 		}
 
 	case instructions.SLO:
-		r := mc.acc8
-		r.Load(value)
-		mc.Status.Carry = r.ASL()
-		mc.Status.Zero = r.IsZero()
-		mc.Status.Sign = r.IsNegative()
-		value = r.Value()
+		mc.acc8.Load(value)
+		mc.Status.Carry = mc.acc8.ASL()
+		mc.Status.Zero = mc.acc8.IsZero()
+		mc.Status.Sign = mc.acc8.IsNegative()
+		value = mc.acc8.Value()
 		mc.A.ORA(value)
 		mc.Status.Zero = mc.A.IsZero()
 		mc.Status.Sign = mc.A.IsNegative()
 
 	case instructions.RLA:
-		r := mc.acc8
-		r.Load(value)
-		mc.Status.Carry = r.ROL(mc.Status.Carry)
-		value = r.Value()
-		mc.A.AND(r.Value())
-		mc.Status.Zero = r.IsZero()
-		mc.Status.Sign = r.IsNegative()
-
-	case instructions.ISC:
-		r := mc.acc8
-		r.Load(value)
-		r.Add(1, false)
-		value = r.Value()
-		mc.Status.Carry, mc.Status.Overflow = mc.A.Subtract(value, mc.Status.Carry)
+		mc.acc8.Load(value)
+		mc.Status.Carry = mc.acc8.ROL(mc.Status.Carry)
+		value = mc.acc8.Value()
+		mc.A.AND(mc.acc8.Value())
 		mc.Status.Zero = mc.A.IsZero()
 		mc.Status.Sign = mc.A.IsNegative()
+
+	case instructions.ISC:
+		mc.acc8.Load(value)
+		mc.acc8.Add(1, false)
+		value = mc.acc8.Value()
+		if mc.Status.DecimalMode {
+			mc.Status.Carry, mc.Status.Zero,
+				mc.Status.Overflow, mc.Status.Sign = mc.A.SubtractDecimal(value, mc.Status.Carry)
+		} else {
+			mc.Status.Carry, mc.Status.Overflow = mc.A.Subtract(value, mc.Status.Carry)
+			mc.Status.Zero = mc.A.IsZero()
+			mc.Status.Sign = mc.A.IsNegative()
+		}
 
 	case instructions.ANC:
 		// immediate AND. puts bit 7 into the carry flag (in microcode terms
@@ -1640,103 +1713,73 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 		mc.A.AND(value)
 		mc.Status.Zero = mc.A.IsZero()
 		mc.Status.Sign = mc.A.IsNegative()
-		mc.Status.Carry = value&0x80 == 0x80
+		mc.Status.Carry = mc.A.Value()&0x80 == 0x80
 
 	case instructions.SRE:
-		// untested
-		r := mc.acc8
-		r.Load(value)
-		mc.Status.Carry = r.LSR()
-		value = r.Value()
+		mc.acc8.Load(value)
+		mc.Status.Carry = mc.acc8.LSR()
+		value = mc.acc8.Value()
 		mc.A.EOR(value)
-		mc.Status.Zero = r.IsZero()
-		mc.Status.Sign = r.IsNegative()
+		mc.Status.Zero = mc.A.IsZero()
+		mc.Status.Sign = mc.A.IsNegative()
 
 	case instructions.RRA:
-		// untested
-		r := mc.acc8
-		r.Load(value)
-		mc.Status.Carry = r.ROR(mc.Status.Carry)
-		value = r.Value()
-		mc.Status.Carry, mc.Status.Overflow = mc.A.Add(value, mc.Status.Carry)
-		mc.Status.Zero = r.IsZero()
-		mc.Status.Sign = r.IsNegative()
+		mc.acc8.Load(value)
+		mc.Status.Carry = mc.acc8.ROR(mc.Status.Carry)
+		value = mc.acc8.Value()
+		if mc.Status.DecimalMode {
+			mc.Status.Carry, mc.Status.Zero,
+				mc.Status.Overflow, mc.Status.Sign = mc.A.AddDecimal(mc.acc8.Value(), mc.Status.Carry)
+		} else {
+			mc.Status.Carry, mc.Status.Overflow = mc.A.Add(mc.acc8.Value(), mc.Status.Carry)
+			mc.Status.Zero = mc.A.IsZero()
+			mc.Status.Sign = mc.A.IsNegative()
+		}
 
 	case instructions.AHX:
-		// untested
-		r := mc.acc8
-		r.Load(mc.A.Value())
-		r.AND(mc.X.Value())
-		r.AND(uint8(mc.PC.Address() >> 8))
+		mc.acc8.Load(mc.A.Value())
+		mc.acc8.AND(mc.X.Value())
+		mc.acc8.AND(uint8(address>>8) + 1)
 
 		// +1 cycle
-		err = mc.write8Bit(address, r.Value(), false)
-		if err != nil {
-			return err
-		}
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
+		err = mc.write8Bit(address, mc.acc8.Value(), false)
 		if err != nil {
 			return err
 		}
 
 	case instructions.TAS:
-		// untested
-		r := mc.acc8
-		r.Load(mc.A.Value())
-		r.AND(mc.X.Value())
-		mc.SP.Load(r.Value())
-
-		// continue working with r and store into address
-		r.AND(uint8(mc.PC.Address() >> 8))
+		mc.acc8.Load(mc.A.Value())
+		mc.acc8.AND(mc.X.Value())
+		mc.SP.Load(mc.acc8.Value())
+		mc.acc8.AND(uint8(address>>8) + 1)
 
 		// +1 cycle
-		err = mc.write8Bit(address, r.Value(), false)
-		if err != nil {
-			return err
-		}
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
+		err = mc.write8Bit(address, mc.acc8.Value(), false)
 		if err != nil {
 			return err
 		}
 
 	case instructions.SHY:
-		// untested
-		r := mc.acc8
-		r.Load(mc.Y.Value())
-		r.AND(uint8(mc.PC.Address() >> 8))
+		mc.acc8.Load(mc.Y.Value())
+		mc.acc8.AND(uint8(address>>8) + 1)
 
 		// +1 cycle
-		err = mc.write8Bit(address, r.Value(), false)
-		if err != nil {
-			return err
-		}
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
+		err = mc.write8Bit(address, mc.acc8.Value(), false)
 		if err != nil {
 			return err
 		}
 
 	case instructions.SHX:
-		// untested
-		r := mc.acc8
-		r.Load(mc.X.Value())
-		r.AND(uint8(mc.PC.Address() >> 8))
+		mc.acc8.Load(mc.X.Value())
+		mc.acc8.AND(uint8(address>>8) + 1)
 
 		// +1 cycle
-		err = mc.write8Bit(address, r.Value(), false)
-		if err != nil {
-			return err
-		}
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
+		err = mc.write8Bit(address, mc.acc8.Value(), false)
 		if err != nil {
 			return err
 		}
 
 	case instructions.LAS:
-		// untested
 		mc.SP.AND(value)
 		mc.A.Load(mc.SP.Value())
 		mc.X.Load(mc.SP.Value())
@@ -1754,18 +1797,15 @@ func (mc *CPU) ExecuteInstruction(cycleCallback func() error) error {
 
 	// for RMW instructions: write altered value back to memory
 	if defn.Effect == instructions.RMW {
+		// +1 cycle
 		err = mc.write8Bit(address, value, false)
 		if err != nil {
 			return err
 		}
-
-		// +1 cycle
-		mc.LastResult.Cycles++
-		err = mc.cycleCallback()
-		if err != nil {
-			return err
-		}
 	}
+
+	// record the CPU Rdy flag at the end of the instruction
+	mc.LastResult.Rdy = mc.RdyFlg
 
 	// finalise result
 	if mc.LastResult.Defn != nil {

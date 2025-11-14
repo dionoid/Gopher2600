@@ -27,9 +27,11 @@ import (
 	"github.com/jetsetilly/gopher2600/hardware"
 	"github.com/jetsetilly/gopher2600/hardware/cpu"
 	"github.com/jetsetilly/gopher2600/hardware/cpu/execution"
+	"github.com/jetsetilly/gopher2600/hardware/cpu/instructions"
 	"github.com/jetsetilly/gopher2600/hardware/memory/cartridge/mapper"
 	"github.com/jetsetilly/gopher2600/hardware/memory/memorymap"
 	"github.com/jetsetilly/gopher2600/hardware/television"
+	"github.com/jetsetilly/gopher2600/hardware/television/coords"
 	"github.com/jetsetilly/gopher2600/logger"
 )
 
@@ -229,14 +231,6 @@ func (dsm *Disassembly) GetEntryByAddress(address uint16) *Entry {
 // checkNextAddr should be false if the result does no represent a completed
 // instruction. in other words, if the instruction has only partially completed
 func (dsm *Disassembly) ExecutedEntry(bank mapper.BankInfo, result execution.Result, checkNextAddr bool, nextAddr uint16) *Entry {
-	// we don't need to do anything if CPU hasn't moved on from previous result
-	if len(dsm.disasmEntries.Sequential) != 0 {
-		last := dsm.disasmEntries.Sequential[len(dsm.disasmEntries.Sequential)-1]
-		if result.Address == last.Result.Address && !result.Defn.IsBranch() {
-			return last
-		}
-	}
-
 	e := dsm.FormatResult(bank, result, EntryLevelExecuted)
 
 	// if co-processor is executing then whatever has been executed by the 6507
@@ -250,62 +244,102 @@ func (dsm *Disassembly) ExecutedEntry(bank mapper.BankInfo, result execution.Res
 		return e
 	}
 
-	// if executed entry is in non-cartridge space then we just format the
-	// result and return it. there's nothing else we can really do - there's no
-	// point caching it anywhere
-	if bank.NonCart {
-		return e
-	}
+	// if executed entry is in non-cartridge space then there's nothing we an do other than updating
+	// the sequential disaasembly
+	if !bank.NonCart {
+		// similarly, if bank number is outside the banks we've already decoded
+		// then format the result and return
+		//
+		// I'm not sure when this would apply. maybe it's just a belt-and-braces
+		// check. there's no comment to say why this condition was added so leave
+		// it for now
+		if bank.Number >= len(dsm.disasmEntries.Entries) {
+			return e
+		}
 
-	// similarly, if bank number is outside the banks we've already decoded
-	// then format the result and return
-	//
-	// I'm not sure when this would apply. maybe it's just a belt-and-braces
-	// check. there's no comment to say why this condition was added so leave
-	// it for now
-	if bank.Number >= len(dsm.disasmEntries.Entries) {
-		return e
-	}
+		// do not update disassembly if background disassembly is ongoing
+		if dsm.background.Load() {
+			return e
+		}
 
-	// do not update disassembly if background disassembly is ongoing
-	if dsm.background.Load() {
-		return e
-	}
+		// updating an entry can happen at the same time as iteration which is
+		// probably being run from a different goroutine. acknowledge the critical
+		// section
+		dsm.crit.Lock()
+		defer dsm.crit.Unlock()
 
-	// updating an entry can happen at the same time as iteration which is
-	// probably being run from a different goroutine. acknowledge the critical
-	// section
-	dsm.crit.Lock()
-	defer dsm.crit.Unlock()
+		// add/update entry to disassembly
+		idx := result.Address & memorymap.CartridgeBits
+		o := dsm.disasmEntries.Entries[bank.Number][idx]
+		if o != nil && o.Result.Final {
+			e.updateExecutionEntry(result)
+		}
+		dsm.disasmEntries.Entries[bank.Number][idx] = e
 
-	// add/update entry to disassembly
-	idx := result.Address & memorymap.CartridgeBits
-	o := dsm.disasmEntries.Entries[bank.Number][idx]
-	if o != nil && o.Result.Final {
-		e.updateExecutionEntry(result)
-	}
-	dsm.disasmEntries.Entries[bank.Number][idx] = e
-
-	// bless next entry in case it was missed by the original decoding. there's
-	// no guarantee that the bank for the next address will be the same as the
-	// current bank, so we have to call the GetBank() function.
-	if checkNextAddr && result.Final {
-		bank = dsm.vcs.Mem.Cart.GetBank(nextAddr)
-		idx := nextAddr & memorymap.CartridgeBits
-		ne := dsm.disasmEntries.Entries[bank.Number][idx]
-		if ne == nil {
-			dsm.disasmEntries.Entries[bank.Number][idx] = dsm.FormatResult(bank, execution.Result{
-				Address: nextAddr,
-			}, EntryLevelBlessed)
-		} else if ne.Level < EntryLevelBlessed {
-			ne.Level = EntryLevelBlessed
+		// bless next entry in case it was missed by the original decoding. there's
+		// no guarantee that the bank for the next address will be the same as the
+		// current bank, so we have to call the GetBank() function.
+		if checkNextAddr && result.Final {
+			bank = dsm.vcs.Mem.Cart.GetBank(nextAddr)
+			idx := nextAddr & memorymap.CartridgeBits
+			ne := dsm.disasmEntries.Entries[bank.Number][idx]
+			if ne == nil {
+				dsm.disasmEntries.Entries[bank.Number][idx] = dsm.FormatResult(bank, execution.Result{
+					Address: nextAddr,
+				}, EntryLevelBlessed)
+			} else if ne.Level < EntryLevelBlessed {
+				ne.Level = EntryLevelBlessed
+			}
 		}
 	}
 
-	// add to sequenctial list
-	dsm.disasmEntries.Sequential = append(dsm.disasmEntries.Sequential, e)
-	if len(dsm.disasmEntries.Sequential) > 10000 {
-		dsm.disasmEntries.Sequential = dsm.disasmEntries.Sequential[1:]
+	// add to sequential list or ammend the last entry as appropriate
+	if len(dsm.disasmEntries.Sequential) != 0 {
+		last := dsm.disasmEntries.Sequential[len(dsm.disasmEntries.Sequential)-1]
+
+		// the decision whether to ammend of append is more complex than you might expect because we
+		// need to consider if the results being worked with is a 'final' result or an interim result
+
+		// when running in the instruction quantum, every result passed to this function will be final
+		if result.Final {
+			// we don't want to do anything with the sequence if the CPU has moved from the RDY
+			// state to the non-RDY state. this prevents STA WSYNC instructions or similar from
+			// being repeated while the CPU is not executing
+			//
+			// looking at the CPU RDY state directly will not work for this. if we only looked the
+			// RDY state directly then that will mean a STA WSYNC instruction, for example, will
+			// appear to have occurred at the beginning of a scanline
+			if result.Rdy || (!result.Rdy && last.Result.Rdy) {
+				// if the last result is not final then that means we are in the cycle of clock
+				// quantums and we need to replace the last entry with the newer result - the newer
+				// result represents the same instruction but it contains more information
+				if !last.Result.Final {
+					dsm.disasmEntries.Sequential[len(dsm.disasmEntries.Sequential)-1] = e
+				} else {
+					if last.Result.Address == result.Address &&
+						!(result.Defn.IsBranch() || result.Defn.Effect != instructions.Flow) {
+						dsm.disasmEntries.Sequential[len(dsm.disasmEntries.Sequential)-1] = e
+					} else {
+						dsm.disasmEntries.Sequential = append(dsm.disasmEntries.Sequential, e)
+					}
+				}
+			}
+		} else if !last.Result.Final {
+			// if the previous entry was not final then always replace it with the new entry
+			// (this can happen when in the cycle or clock quantums)
+			dsm.disasmEntries.Sequential[len(dsm.disasmEntries.Sequential)-1] = e
+		} else {
+			// if the new result is not final and the last result was final then append the new entry
+			// (this can happen when in the cycle or clock quantums)
+			dsm.disasmEntries.Sequential = append(dsm.disasmEntries.Sequential, e)
+		}
+	} else {
+		dsm.disasmEntries.Sequential = append(dsm.disasmEntries.Sequential, e)
+	}
+
+	const maxLength = 10000
+	if len(dsm.disasmEntries.Sequential) > maxLength {
+		dsm.disasmEntries.Sequential = dsm.disasmEntries.Sequential[len(dsm.disasmEntries.Sequential)-maxLength:]
 	}
 
 	return e
@@ -332,6 +366,7 @@ func (dsm *Disassembly) FormatResult(bank mapper.BankInfo, result execution.Resu
 			result: result,
 			bank:   bank,
 		},
+		Coords: dsm.vcs.TV.GetCoords(),
 	}
 
 	// address of instruction
@@ -428,4 +463,21 @@ func (dsm *Disassembly) BorrowDisasm(f func(*DisasmEntries)) bool {
 
 	f(&dsm.disasmEntries)
 	return true
+}
+
+// Splice implements the rewinder.Splicer interface
+func (dsm *Disassembly) Splice(c coords.TelevisionCoords) {
+	dsm.crit.Lock()
+	defer dsm.crit.Unlock()
+
+	for i, e := range dsm.disasmEntries.Sequential {
+		if coords.GreaterThan(e.Coords, c) {
+			if i == 0 {
+				dsm.disasmEntries.Sequential = dsm.disasmEntries.Sequential[:0]
+			} else {
+				dsm.disasmEntries.Sequential = dsm.disasmEntries.Sequential[:i-1]
+			}
+			break // for loop
+		}
+	}
 }

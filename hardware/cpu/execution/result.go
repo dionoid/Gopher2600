@@ -76,6 +76,17 @@ type Result struct {
 	// whether this data has been finalised - some fields in this struct will
 	// be undefined if Final is false
 	Final bool
+
+	// was this result as a result of an interrupt
+	FromInterrupt bool
+
+	// was this result executed inside an interrupt
+	InInterrupt bool
+
+	// whether the CPU was in the RDY state at the end of the instruction. on the 2600/7800 the CPU
+	// can be out of the RDY state if an instruction has written to the WSYNC memory address. this
+	// field is undefined if Final is false
+	Rdy bool
 }
 
 // Reset nullifies all members of the Result instance.
@@ -88,6 +99,7 @@ func (r *Result) Reset() {
 	r.PageFault = false
 	r.CPUBug = ""
 	r.Final = false
+	r.FromInterrupt = false
 }
 
 // very rough disassembly. it should not be used in preference to the

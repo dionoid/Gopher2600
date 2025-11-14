@@ -466,6 +466,9 @@ func NewDebugger(opts CommandLineOptions, create CreateUserInterface) (*Debugger
 	dbg.counter = counter.NewCounter(dbg.vcs)
 	dbg.Rewind.AddTimelineCounter(dbg.counter)
 
+	// add disassembly to rewind system. this is for the sequential disassembly listing
+	dbg.Rewind.AddSplicer(dbg.Disasm)
+
 	// adding TV frame triggers in setMode(). what the TV triggers on depending
 	// on the mode for performance reasons (eg. no reflection required in
 	// playmode)
@@ -1035,6 +1038,10 @@ func (dbg *Debugger) reset(newCartridge bool) error {
 		return err
 	}
 
+	// it is important that we reset the cpuBoundaryLastInstruction with the reset TV coordinates
+	// because the zero value of the TelevisionCoords type is not the starting position of the TV
+	dbg.cpuBoundaryLastInstruction = dbg.vcs.TV.GetCoords()
+
 	dbg.ClearHaltReason()
 	dbg.Rewind.Reset()
 	dbg.Tracker.Reset()
@@ -1048,6 +1055,7 @@ func (dbg *Debugger) reset(newCartridge bool) error {
 	}
 
 	dbg.Disasm.Reset()
+	dbg.liveBankInfo = mapper.BankInfo{}
 	dbg.liveDisasmEntry = &disassembly.Entry{Result: execution.Result{Final: true}}
 	return nil
 }

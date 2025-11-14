@@ -143,12 +143,16 @@ func (win *winControl) drawStep() {
 		imgui.BeginGroup()
 		imgui.TableNextColumn()
 		win.repeatButton(fmt.Sprintf("%c ##Step", fonts.BackArrowDouble), func() {
-			win.img.term.pushCommand("STEP BACK")
+			if win.img.dbg.State() == govern.Paused {
+				win.img.term.pushCommand("STEP BACK")
+			}
 		})
 
 		imgui.SameLineV(0.0, 0.0)
 		win.repeatButtonV("Step", func() {
-			win.img.term.pushCommand("STEP")
+			if win.img.dbg.State() == govern.Paused {
+				win.img.term.pushCommand("STEP")
+			}
 		}, fillWidth)
 		imgui.EndGroup()
 
@@ -173,7 +177,9 @@ func (win *winControl) drawStep() {
 	}
 
 	win.repeatButtonV(fmt.Sprintf("%c Step Over", fonts.StepOver), func() {
-		win.img.term.pushCommand("STEP OVER")
+		if win.img.dbg.State() == govern.Paused {
+			win.img.term.pushCommand("STEP OVER")
+		}
 	}, fillWidth)
 
 	if imgui.BeginTable("stepframescanline", 2) {
@@ -184,11 +190,15 @@ func (win *winControl) drawStep() {
 
 		imgui.BeginGroup()
 		win.repeatButton(fmt.Sprintf("%c ##Frame", fonts.UpArrowDouble), func() {
-			win.img.term.pushCommand("STEP BACK FRAME")
+			if win.img.dbg.State() == govern.Paused {
+				win.img.term.pushCommand("STEP BACK FRAME")
+			}
 		})
 		imgui.SameLineV(0.0, 0.0)
 		win.repeatButtonV("Frame", func() {
-			win.img.term.pushCommand("STEP FRAME")
+			if win.img.dbg.State() == govern.Paused {
+				win.img.term.pushCommand("STEP FRAME")
+			}
 		}, fillWidth)
 		imgui.EndGroup()
 
@@ -196,11 +206,15 @@ func (win *winControl) drawStep() {
 
 		imgui.BeginGroup()
 		win.repeatButton(fmt.Sprintf("%c ##Scanline", fonts.UpArrow), func() {
-			win.img.term.pushCommand("STEP BACK SCANLINE")
+			if win.img.dbg.State() == govern.Paused {
+				win.img.term.pushCommand("STEP BACK SCANLINE")
+			}
 		})
 		imgui.SameLineV(0.0, 0.0)
 		win.repeatButtonV("Scanline", func() {
-			win.img.term.pushCommand("STEP SCANLINE")
+			if win.img.dbg.State() == govern.Paused {
+				win.img.term.pushCommand("STEP SCANLINE")
+			}
 		}, fillWidth)
 		imgui.EndGroup()
 
@@ -209,7 +223,7 @@ func (win *winControl) drawStep() {
 }
 
 func (win *winControl) drawFPS() {
-	req := win.img.dbg.VCS().TV.GetReqFPS()
+	ideal := win.img.dbg.VCS().TV.GetIdealFPS()
 	actual, _ := win.img.dbg.VCS().TV.GetActualFPS()
 	frameInfo := win.img.cache.TV.GetFrameInfo()
 
@@ -221,8 +235,8 @@ func (win *winControl) drawFPS() {
 	defer imgui.PopItemWidth()
 
 	// fps slider
-	if imgui.SliderFloatV("##fps", &req, 1, 100, "%.0f fps", imgui.SliderFlagsNone) {
-		win.img.dbg.PushFunction(func() { win.img.dbg.VCS().TV.SetFPS(req) })
+	if imgui.SliderFloatV("##fps", &ideal, 1, 100, "%.0f fps", imgui.SliderFlagsNone) {
+		win.img.dbg.PushFunction(func() { win.img.dbg.VCS().TV.SetFPS(ideal) })
 	}
 
 	// reset to specification rate on right mouse click
@@ -232,16 +246,16 @@ func (win *winControl) drawFPS() {
 
 	imgui.Spacing()
 	if win.img.dbg.State() == govern.Running {
-		if actual <= req*0.95 {
+		if actual <= ideal*0.95 {
 			imgui.Text("running below requested FPS")
-		} else if actual > req*1.05 {
+		} else if actual > ideal*1.05 {
 			imgui.Text("running above requested FPS")
 		} else {
 			imgui.Text("running at requested FPS")
 		}
-	} else if req < frameInfo.Spec.RefreshRate*0.95 {
+	} else if ideal < frameInfo.Spec.RefreshRate*0.95 {
 		imgui.Text(fmt.Sprintf("below ideal frequency of %.0fHz", frameInfo.Spec.RefreshRate))
-	} else if req > frameInfo.Spec.RefreshRate*1.05 {
+	} else if ideal > frameInfo.Spec.RefreshRate*1.05 {
 		imgui.Text(fmt.Sprintf("above ideal frequency of %.0fHz", frameInfo.Spec.RefreshRate))
 	} else {
 		imgui.Text(fmt.Sprintf("ideal frequency %.0fHz", frameInfo.Spec.RefreshRate))
